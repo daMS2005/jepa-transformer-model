@@ -1,0 +1,5 @@
+# Default deny: every tracked path must be explicitly allowed below.
+*
+
+!.gitignore
+!README.md
