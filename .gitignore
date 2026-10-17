@@ -3,3 +3,28 @@
 
 !.gitignore
 !README.md
+!pyproject.toml
+!train.py
+
+# Data layer
+!configs/
+!configs/data/
+!configs/data/example.toml
+!configs/model/
+!configs/model/*.toml
+!src/
+!src/jepa_transformer/
+!src/jepa_transformer/*.py
+!src/jepa_transformer/models/
+!src/jepa_transformer/models/*.py
+!src/jepa_transformer/kernels/
+!src/jepa_transformer/kernels/*.py
+!src/jepa_transformer/kernels/README.md
+!src/jepa_transformer/kernels/triton/
+!src/jepa_transformer/kernels/triton/*.py
+!src/jepa_transformer/data/
+!src/jepa_transformer/data/*.py
+!src/jepa_transformer/training/
+!src/jepa_transformer/training/*.py
+!tests/
+!tests/*.py

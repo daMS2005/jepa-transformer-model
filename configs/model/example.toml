@@ -1,0 +1,57 @@
+# Annotated model configuration. Every field is listed with its meaning; the four
+# runnable presets (xs, s, m, l) set the same fields. Sections map one-to-one onto
+# RuntimeConfig, JEPAConfig and TransformerConfig in src/jepa_transformer/config.py.
+# Training hyperparameters are starting points, not tuned values.
+
+[runtime]
+seed = 0
+device = "cuda"
+precision = "float32"            # float32 | bfloat16 | float16. float32 + kernel_backend "triton" runs
+                                 # strict FP32 math: Triton 3xTF32 matmuls, FP32-accurate on tensor cores.
+num_workers = 8                  # DataLoader workers
+checkpoint_directory = "checkpoints/example"
+
+[jepa]
+input_dim = 20                   # daily features per asset (data cache width; train.py takes it from the cache)
+output_dim = 384                 # representation size; equals transformer.input_dim and d
+hidden_dim = 384                 # JEPA residual-stream width
+depth = 3                        # one input block followed by two residual blocks
+residual = true
+dropout = 0.1
+mask_ratio = 0.5                 # share of available features hidden from the context encoder
+target_momentum = 0.996          # EMA decay of the target encoder
+learning_rate = 1e-3
+min_learning_rate = 1e-4         # cosine floor
+weight_decay = 0.05
+max_grad_norm = 1.0
+num_epochs = 100
+# Optional per-group input encoders: one small MLP per feature group, sizes summing to input_dim.
+# feature_groups = [["price", 13], ["risk", 3], ["liquidity", 4], ...]
+# input_encoder_dim = 64
+# input_encoder_depth = 1
+
+[transformer]
+input_dim = 384                  # = jepa.output_dim = d
+sequence_lengths = [20, 60, 120, 252, 504]
+target_dim = 3                   # horizons 1, 5, 20 days
+head = "student_t"               # linear (MSE) | student_t (NLL)
+jepa_checkpoint = "checkpoints/jepa.pt"
+d = 384                          # residual width
+out_proj = 384                   # total Q/K/V width; out_proj / n_heads must be even (RoPE)
+n_heads = 6
+n_layers = 6
+hidden_dim = 1536                # SwiGLU width, about 4 * d
+n_experts = 8
+moe_topk = 2                     # experts active per token
+moe_layers = [2, 3]              # zero-based block indices; first and last blocks stay dense
+moe_loss_weight = 0.01           # load-balancing loss weight
+max_seq = 504                    # two trading years
+dropout = 0.1
+rope_base = 10000.0
+norm_eps = 1e-6
+kernel_backend = "triton"        # torch | triton (Triton MoE experts, 3xTF32 FP32 linears)
+learning_rate = 6e-4
+min_learning_rate = 6e-5
+weight_decay = 0.05
+max_grad_norm = 1.0
+num_epochs = 60

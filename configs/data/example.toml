@@ -1,0 +1,189 @@
+# Example feature specification for the JEPA data layer (src/jepa_transformer/data).
+#
+# A small feature set that exercises every mechanism of the loader: per-asset price
+# stages, asset/date/as-of sources, masks, cross-sectional and training-window
+# normalization, and an embedding reduced by PCA. Replace it with your own
+# specification; the replica schema it reads is described in README.md.
+#
+# Row t may use only information available by the close of trading day t.
+# SQL runs in DuckDB against the read-only replica. Window functions may not look
+# forward (LEAD, FOLLOWING, DESC are rejected), and known look-ahead columns are
+# rejected by name.
+#
+# Transforms per feature: log ("ln" | "log1p") -> clip [low, high] -> norm:
+#   train_z  mean/sd from training-split member rows up to splits.fit_end, then +-z_clip
+#   cs_rank  rank in [-1, 1] among core+extended members on date t
+#   cs_z     z-score among core+extended members on date t
+# Missing values stay NaN; "mask" names a 0/1 mask channel that also blanks the value.
+
+[universe]
+members = "pit_top1000_v1"
+context = "context_etf_v1"
+lookback_sessions = 252
+
+[splits]
+salt = "jepa-split-v1"
+core_fraction = 0.6
+extended_fraction = 0.2
+liquidity_end = 2023-12-31
+train_end = 2023-12-31
+val_end = 2024-12-31
+test_end = 2026-10-02
+extended_train_end = 2025-12-31
+fit_end = 2023-12-31
+# select: every group trains <= train_end (val out of time); final: core <= val_end, extended <= extended_train_end
+phase = "select"
+
+[labels]
+horizons = [1, 5, 20]
+
+[normalization]
+z_clip = 5.0
+
+# Per-asset price stages, each a SELECT over the previous one. Window w is the
+# asset's continuity segment in date order; k is the row index in it.
+[[price_stage]]
+r = "CASE WHEN previous_link_valid AND close > 0 AND lag(close) OVER w > 0 THEN ln(close * split_ratio / lag(close) OVER w) END"
+hl = "CASE WHEN high > 0 AND low > 0 THEN ln(high / low) END"
+intra = "CASE WHEN open > 0 AND close > 0 THEN ln(close / open) END"
+ohlc_ok = "open > 0 AND high > 0 AND low > 0 AND close > 0"
+
+[[price_stage]]
+lp = "sum(coalesce(r, 0)) OVER w"
+gk = "0.5 * hl * hl - (2 * ln(2) - 1) * intra * intra"
+
+[[price_stage]]
+mom_20 = "CASE WHEN k > 20 THEN lp - lag(lp, 20) OVER w END"
+vol_gk_20 = "CASE WHEN count(gk) OVER (w ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) >= 15 THEN sqrt(greatest(avg(gk) OVER (w ROWS BETWEEN 19 PRECEDING AND CURRENT ROW), 0)) END"
+
+# ---------------------------------------------------------------- price (per asset, from the price stages)
+[[block]]
+name = "price"
+
+[[block.feature]]
+name = "ohlc_ok"
+sql = "ohlc_ok"
+kind = "mask"
+
+[[block.feature]]
+name = "ret_1d"
+sql = "r"
+clip = [-0.25, 0.25]
+norm = "train_z"
+mask = "ohlc_ok"
+
+[[block.feature]]
+name = "mom_20"
+sql = "mom_20"
+norm = "cs_rank"
+
+[[block.feature]]
+name = "vol_gk_20"
+sql = "vol_gk_20"
+log = "ln"
+norm = "train_z"
+
+# ---------------------------------------------------------------- market (per date, from context ETFs)
+[[block]]
+name = "market"
+
+[block.source]
+kind = "date"
+sql = """
+SELECT p.trading_date, max(p.r) FILTER (WHERE c.symbol = 'SPY') AS spy_r
+FROM px p JOIN ctx c USING (con_id) GROUP BY p.trading_date
+"""
+
+[[block.feature]]
+name = "spy_ret"
+sql = "spy_r"
+clip = [-0.12, 0.12]
+norm = "train_z"
+
+# ---------------------------------------------------------------- fundamentals (per asset and date)
+[[block]]
+name = "fundamentals"
+requires = ["sec_daily_fundamentals_model_v1"]
+
+[block.source]
+kind = "asset"
+sql = """
+SELECT con_id, trading_date, log_assets, cash_to_assets, TRUE AS sec_row
+FROM sec_daily_fundamentals_model_v1
+"""
+
+[[block.feature]]
+name = "sec_present"
+sql = "sec_row"
+kind = "mask"
+
+[[block.feature]]
+name = "log_assets"
+sql = "log_assets"
+norm = "cs_z"
+mask = "sec_present"
+
+[[block.feature]]
+name = "cash_ta"
+sql = "cash_to_assets"
+norm = "train_z"
+mask = "sec_present"
+
+# ---------------------------------------------------------------- macro (per date, vintage-correct as-of values)
+[[block]]
+name = "macro"
+requires = ["macro_daily_asof"]
+
+[block.source]
+kind = "date"
+sql = """
+SELECT trading_date,
+  max(value) FILTER (WHERE series_id = 'DGS3MO') AS dgs3mo,
+  max(CASE WHEN value > 0 THEN ln(value) END) FILTER (WHERE series_id = 'VIXCLS') AS l_vix
+FROM macro_daily_asof GROUP BY trading_date
+"""
+
+[[block.feature]]
+name = "short_rate"
+sql = "dgs3mo"
+norm = "train_z"
+
+[[block.feature]]
+name = "vix"
+sql = "l_vix"
+norm = "train_z"
+
+# ---------------------------------------------------------------- text embedding (as-of, reduced by PCA)
+# One row per description period, usable from its available_date until the next
+# one. PCA is fit on training rows only; its components are one JEPA masking unit.
+[[block]]
+name = "sec_descriptions"
+requires = ["sec_description_asof_model_v1", "sec_description_embeddings_model_v1"]
+
+[block.source]
+kind = "asof"
+sql = """
+SELECT a.con_id, a.valid_from AS trading_date, a.valid_until AS desc_until, e.available_date AS desc_date,
+       e.embedding AS sec_description_embedding
+FROM sec_description_asof_model_v1 a JOIN sec_description_embeddings_model_v1 e USING (section_id)
+"""
+
+[[block.feature]]
+name = "sec_desc_ok"
+sql = "desc_date IS NOT NULL AND (desc_until IS NULL OR trading_date < desc_until)"
+kind = "mask"
+
+[[block.feature]]
+name = "sec_desc_age"
+sql = "trading_date - desc_date"
+log = "log1p"
+norm = "train_z"
+mask = "sec_desc_ok"
+
+[[block.feature]]
+name = "sec_pc"
+sql = "sec_description_embedding"
+kind = "embedding"
+dim = 768
+pca = 8
+mask = "sec_desc_ok"
